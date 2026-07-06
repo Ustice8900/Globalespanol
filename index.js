@@ -134,4 +134,76 @@ app.post('/api/plan', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// --- Батч-перевод слов через Claude Haiku (используется при "прогреве" словаря) ---
+async function translateBatch(words) {
+  const wordList = words.map(w => w.word).join(', ');
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5',
+    max_tokens: 2048,
+    system: 'Ты профессиональный лексикограф испанского языка. Отвечай ТОЛЬКО валидным JSON-массивом, без пояснений, без markdown-обёртки.',
+    messages: [{
+      role: 'user',
+      content: `Для каждого испанского слова из списка дай: перевод на русский (translation_ru), русскую транскрипцию произношения кириллицей (transcription_ru), короткий пример предложения на испанском (example_es) и его перевод на русский (example_ru).
+Слова: ${wordList}
+Ответ строго в виде JSON-массива объектов в том же порядке, без каких-либо пояснений:
+[{"word":"...", "translation_ru":"...", "transcription_ru":"...", "example_es":"...", "example_ru":"..."}]`
+    }]
+  });
+
+  const raw = response.content[0].text.trim();
+  const clean = raw.replace(/^```json\s*|\s*```$/g, '');
+  return JSON.parse(clean);
+}
+
+app.get('/api/words/:level', async (req, res) => {
+  try {
+    const level = req.params.level;
+    const allowedLevels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+    if (!allowedLevels.includes(level)) return res.status(400).json({ error: 'Некорректный уровень' });
+
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const offset = Math.max(parseInt(req.query.offset) || 0, 0);
+
+    const cacheKey = `words_${level}_${limit}_${offset}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json({ words: cached, fromCache: true });
+
+    const { data, error } = await supabase
+      .from('vocabulary')
+      .select('word, level, frequency_rank, translation_ru, transcription_ru, example_es, example_ru')
+      .eq('level', level)
+      .order('frequency_rank', { ascending: true })
+      .range(offset, offset + limit - 1);
+
+    if (error) throw error;
+
+    const missing = data.filter(w => !w.translation_ru);
+
+    if (missing.length > 0) {
+      try {
+        const translated = await translateBatch(missing);
+        const byWord = Object.fromEntries(translated.map(t => [t.word, t]));
+
+        for (const t of translated) {
+          await supabase.from('vocabulary').update({
+            translation_ru: t.translation_ru,
+            transcription_ru: t.transcription_ru,
+            example_es: t.example_es,
+            example_ru: t.example_ru
+          }).eq('word', t.word);
+        }
+
+        data.forEach(w => {
+          if (byWord[w.word]) Object.assign(w, byWord[w.word]);
+        });
+      } catch (translateError) {
+        console.error('Ошибка перевода батча:', translateError.message);
+      }
+    }
+
+    cache.set(cacheKey, data, 3600);
+    res.json({ words: data, fromCache: false });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(process.env.PORT || 3001, () => console.log('Сервер запущен на порту 3001'));
